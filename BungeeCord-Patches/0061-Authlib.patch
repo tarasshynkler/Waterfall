@@ -1,0 +1,420 @@
+From 42c869a4fc4fc19df0fdd13e9a99abc2ac7be23a Mon Sep 17 00:00:00 2001
+From: Zaxar163 <zahar.vcherachny@yandex.ru>
+Date: Fri, 10 Apr 2020 19:29:04 +0300
+Subject: [PATCH] Fix for use mojang authlib...
+
+
+diff --git a/proxy/pom.xml b/proxy/pom.xml
+index 54500dde..a14ea976 100644
+--- a/proxy/pom.xml
++++ b/proxy/pom.xml
+@@ -22,7 +22,12 @@
+         <maven.deploy.skip>true</maven.deploy.skip>
+         <maven.javadoc.skip>true</maven.javadoc.skip>
+     </properties>
+-
++    <repositories>
++        <repository>
++            <id>mojang</id>
++            <url>https://libraries.minecraft.net/</url>
++        </repository>
++    </repositories>
+     <dependencies>
+         <dependency>
+             <groupId>com.flowpowered</groupId>
+@@ -49,6 +54,11 @@
+             <version>${netty.version}</version>
+             <scope>compile</scope>
+         </dependency>
++        <dependency>
++            <groupId>com.mojang</groupId>
++            <artifactId>authlib</artifactId>
++            <version>1.5.25</version>
++        </dependency>
+         <!-- Waterfall End -->
+         <dependency>
+             <groupId>io.netty</groupId>
+diff --git a/proxy/src/main/java/net/md_5/bungee/connection/AuthServiceSingleton.java b/proxy/src/main/java/net/md_5/bungee/connection/AuthServiceSingleton.java
+new file mode 100644
+index 00000000..953fb205
+--- /dev/null
++++ b/proxy/src/main/java/net/md_5/bungee/connection/AuthServiceSingleton.java
+@@ -0,0 +1,12 @@
++package net.md_5.bungee.connection;
++
++import java.net.Proxy;
++import java.util.UUID;
++
++import com.mojang.authlib.minecraft.MinecraftSessionService;
++import com.mojang.authlib.yggdrasil.YggdrasilAuthenticationService;
++
++public class AuthServiceSingleton {
++	public static YggdrasilAuthenticationService authService = new YggdrasilAuthenticationService(Proxy.NO_PROXY, UUID.randomUUID().toString());
++	public static MinecraftSessionService sessionService = authService.createMinecraftSessionService();
++}
+\ No newline at end of file
+diff --git a/proxy/src/main/java/net/md_5/bungee/connection/InitialHandler.java b/proxy/src/main/java/net/md_5/bungee/connection/InitialHandler.java
+index 007d3daf..1db3e2a0 100644
+--- a/proxy/src/main/java/net/md_5/bungee/connection/InitialHandler.java
++++ b/proxy/src/main/java/net/md_5/bungee/connection/InitialHandler.java
+@@ -2,7 +2,14 @@ package net.md_5.bungee.connection;
+
+ import com.google.common.base.Charsets;
+ import com.google.common.base.Preconditions;
++import com.google.common.collect.Lists;
+ import com.google.gson.Gson;
++import net.md_5.bungee.connection.LoginResult.Property;
++import java.net.InetAddress;
++import com.mojang.authlib.GameProfile;
++import com.mojang.authlib.exceptions.AuthenticationUnavailableException;
++import com.mojang.authlib.yggdrasil.YggdrasilAuthenticationService;
++
+ import java.math.BigInteger;
+ import java.net.InetSocketAddress;
+ import java.net.SocketAddress;
+@@ -192,18 +199,18 @@ public class InitialHandler extends PacketHandler implements PendingConnection
+
+                 if ( v1_5 )
+                 {
+-                    kickMessage = ChatColor.DARK_BLUE
+-                            + "\00" + 127
+-                            + '\00' + legacy.getVersion().getName()
+-                            + '\00' + getFirstLine( legacy.getDescription() )
+-                            + '\00' + legacy.getPlayers().getOnline()
+-                            + '\00' + legacy.getPlayers().getMax();
++                    kickMessage = ChatColor.DARK_BLUE +
++                         "\00" +
++                         '\00' + legacy.getVersion().getName() +
++                         '\00' + getFirstLine( legacy.getDescription() ) +
++                         '\00' + legacy.getPlayers().getOnline() +
++                         '\00' + legacy.getPlayers().getMax();
+                 } else
+                 {
+                     // Clients <= 1.3 don't support colored motds because the color char is used as delimiter
+-                    kickMessage = ChatColor.stripColor( getFirstLine( legacy.getDescription() ) )
+-                            + '\u00a7' + legacy.getPlayers().getOnline()
+-                            + '\u00a7' + legacy.getPlayers().getMax();
++                    kickMessage = ChatColor.stripColor( getFirstLine( legacy.getDescription() )  +
++                         '\u00a7' + legacy.getPlayers().getOnline() +
++                         '\u00a7' + legacy.getPlayers().getMax());
+                 }
+
+                 ch.close( kickMessage );
+@@ -418,154 +425,167 @@ public class InitialHandler extends PacketHandler implements PendingConnection
+         bungee.getPluginManager().callEvent( new PreLoginEvent( InitialHandler.this, callback ) );
+     }
+
+-    @Override
+-    public void handle(final EncryptionResponse encryptResponse) throws Exception
+-    {
+-        Preconditions.checkState( thisState == State.ENCRYPT, "Not expecting ENCRYPT" );
+-
+-        SecretKey sharedKey = EncryptionUtil.getSecret( encryptResponse, request );
+-        BungeeCipher decrypt = EncryptionUtil.getCipher( false, sharedKey );
+-        ch.addBefore( PipelineUtils.FRAME_DECODER, PipelineUtils.DECRYPT_HANDLER, new CipherDecoder( decrypt ) );
+-        BungeeCipher encrypt = EncryptionUtil.getCipher( true, sharedKey );
+-        ch.addBefore( PipelineUtils.FRAME_PREPENDER, PipelineUtils.ENCRYPT_HANDLER, new CipherEncoder( encrypt ) );
+-
+-        String encName = URLEncoder.encode( InitialHandler.this.getName(), "UTF-8" );
+-
+-        MessageDigest sha = MessageDigest.getInstance( "SHA-1" );
+-        for ( byte[] bit : new byte[][]
+-        {
+-            request.getServerId().getBytes( "ISO_8859_1" ), sharedKey.getEncoded(), EncryptionUtil.keys.getPublic().getEncoded()
+-        } )
+-        {
+-            sha.update( bit );
+-        }
+-        String encodedHash = URLEncoder.encode( new BigInteger( sha.digest() ).toString( 16 ), "UTF-8" );
+-
+-        String preventProxy = ( BungeeCord.getInstance().config.isPreventProxyConnections() && getSocketAddress() instanceof InetSocketAddress ) ? "&ip=" + URLEncoder.encode( getAddress().getAddress().getHostAddress(), "UTF-8" ) : "";
+-        String authURL = "https://sessionserver.mojang.com/session/minecraft/hasJoined?username=" + encName + "&serverId=" + encodedHash + preventProxy;
+-
+-        Callback<String> handler = new Callback<String>()
+-        {
+-            @Override
+-            public void done(String result, Throwable error)
+-            {
+-                if ( error == null )
+-                {
+-                    LoginResult obj = BungeeCord.getInstance().gson.fromJson( result, LoginResult.class );
+-                    if ( obj != null && obj.getId() != null )
+-                    {
+-                        loginProfile = obj;
+-                        name = obj.getName();
+-                        uniqueId = Util.getUUID( obj.getId() );
+-                        finish();
+-                        return;
+-                    }
+-                    disconnect( bungee.getTranslation( "offline_mode_player" ) );
+-                } else
+-                {
+-                    disconnect( bungee.getTranslation( "mojang_fail" ) );
+-                    bungee.getLogger().log( Level.SEVERE, "Error authenticating " + getName() + " with minecraft.net", error );
+-                }
+-            }
+-        };
+-
+-        HttpClient.get( authURL, ch.getHandle().eventLoop(), handler );
+-    }
+-
+-    private void finish()
+-    {
+-        if ( isOnlineMode() )
+-        {
+-            // Check for multiple connections
+-            // We have to check for the old name first
+-            ProxiedPlayer oldName = bungee.getPlayer( getName() );
+-            if ( oldName != null )
+-            {
+-                // TODO See #1218
+-                oldName.disconnect( bungee.getTranslation( "already_connected_proxy" ) );
+-            }
+-            // And then also for their old UUID
+-            ProxiedPlayer oldID = bungee.getPlayer( getUniqueId() );
+-            if ( oldID != null )
+-            {
+-                // TODO See #1218
+-                oldID.disconnect( bungee.getTranslation( "already_connected_proxy" ) );
+-            }
+-        } else
+-        {
+-            // In offline mode the existing user stays and we kick the new one
+-            ProxiedPlayer oldName = bungee.getPlayer( getName() );
+-            if ( oldName != null )
+-            {
+-                // TODO See #1218
+-                disconnect( bungee.getTranslation( "already_connected_proxy" ) );
+-                return;
+-            }
+-
+-        }
+-
+-        offlineId = UUID.nameUUIDFromBytes( ( "OfflinePlayer:" + getName() ).getBytes( Charsets.UTF_8 ) );
+-        if ( uniqueId == null )
+-        {
+-            uniqueId = offlineId;
+-        }
+-
+-        Callback<LoginEvent> complete = new Callback<LoginEvent>()
+-        {
+-            @Override
+-            public void done(LoginEvent result, Throwable error)
+-            {
+-                if ( result.isCancelled() )
+-                {
+-                    disconnect( result.getCancelReasonComponents() );
+-                    return;
+-                }
+-                if ( ch.isClosed() )
+-                {
+-                    return;
+-                }
+-
+-                ch.getHandle().eventLoop().execute( new Runnable()
+-                {
+-                    @Override
+-                    public void run()
+-                    {
+-                        if ( !ch.isClosing() )
+-                        {
+-                            UserConnection userCon = new UserConnection( bungee, ch, getName(), InitialHandler.this );
+-                            userCon.setCompressionThreshold( BungeeCord.getInstance().config.getCompressionThreshold() );
+-                            userCon.init();
+-
+-                            unsafe.sendPacket( new LoginSuccess( getUniqueId().toString(), getName() ) ); // With dashes in between
+-                            ch.setProtocol( Protocol.GAME );
+-
+-                            ch.getHandle().pipeline().get( HandlerBoss.class ).setHandler( new UpstreamBridge( bungee, userCon ) );
+-                            bungee.getPluginManager().callEvent( new PostLoginEvent( userCon ) );
+-                            ServerInfo server;
+-                            if ( bungee.getReconnectHandler() != null )
+-                            {
+-                                server = bungee.getReconnectHandler().getServer( userCon );
+-                            } else
+-                            {
+-                                server = AbstractReconnectHandler.getForcedHost( InitialHandler.this );
+-                            }
+-                            if ( server == null )
+-                            {
+-                                server = bungee.getServerInfo( listener.getDefaultServer() );
+-                            }
+-
+-                            userCon.connect( server, null, true, ServerConnectEvent.Reason.JOIN_PROXY );
+-
+-                            thisState = State.FINISHED;
+-                        }
+-                    }
+-                } );
+-            }
+-        };
+-
+-        // fire login event
+-        bungee.getPluginManager().callEvent( new LoginEvent( InitialHandler.this, complete, this.getLoginProfile() ) ); // Waterfall: Parse LoginResult object to new constructor of LoginEvent
+-    }
++	@Override
++	public void handle(final EncryptionResponse encryptResponse) throws Exception {
++		Preconditions.checkState(thisState == State.ENCRYPT, "Not expecting ENCRYPT");
++
++		SecretKey sharedKey = EncryptionUtil.getSecret(encryptResponse, request);
++		BungeeCipher decrypt = EncryptionUtil.getCipher(false, sharedKey);
++		ch.addBefore(PipelineUtils.FRAME_DECODER, PipelineUtils.DECRYPT_HANDLER, new CipherDecoder(decrypt));
++		BungeeCipher encrypt = EncryptionUtil.getCipher(true, sharedKey);
++		ch.addBefore(PipelineUtils.FRAME_PREPENDER, PipelineUtils.ENCRYPT_HANDLER, new CipherEncoder(encrypt));
++
++		MessageDigest sha = MessageDigest.getInstance("SHA-1");
++		for (byte[] bit : new byte[][] { request.getServerId().getBytes("ISO_8859_1"), sharedKey.getEncoded(),
++				EncryptionUtil.keys.getPublic().getEncoded() }) {
++			sha.update(bit);
++		}
++		String encodedHash = new BigInteger(sha.digest()).toString(16);
++
++		InetAddress preventProxy =  BungeeCord.getInstance().config.isPreventProxyConnections() ? getAddress().getAddress() : null;// ( (
++																// BungeeCord.getInstance().config.isPreventProxyConnections()
++																// ) ? "&ip=" + URLEncoder.encode(
++																// getAddress().getAddress().getHostAddress(), "UTF-8" )
++																// : "" );
++
++		// String authURL =
++		// "https://sessionserver.mojang.com/session/minecraft/hasJoined?username=" +
++		// encName + "&serverId=" + encodedHash + preventProxy;
++		(new Thread("User Authenticator") {
++			public void run() {
++				try {
++					GameProfile filledInProfile = AuthServiceSingleton.sessionService
++							.hasJoinedServer(new GameProfile(null, InitialHandler.this.getName()), encodedHash, preventProxy);
++					if (filledInProfile == null) {
++						disconnect(bungee.getTranslation("offline_mode_player"));
++						return;
++					}
++
++					List<Property> props = Lists.newArrayList();
++
++					for (com.mojang.authlib.properties.Property prop : filledInProfile.getProperties().values()) {
++						props.add(new Property(prop.getName(), prop.getValue(), prop.getSignature()));
++					}
++
++					LoginResult loginResult = new LoginResult(filledInProfile.getId().toString().replace("-", ""),
++							filledInProfile.getName(), props.toArray(new Property[props.size()]));
++
++					loginProfile = loginResult;
++					name = loginResult.getName();
++					uniqueId = Util.getUUID(loginResult.getId());
++					finish();
++					return;
++				} catch (AuthenticationUnavailableException e) {
++					disconnect(bungee.getTranslation("mojang_fail"));
++				}
++			}
++		}).start();
++
++		/*
++		 * Callback<String> handler = new Callback<String>() {
++		 *
++		 * @Override public void done(String result, Throwable error) { if ( error ==
++		 * null ) { LoginResult obj = BungeeCord.getInstance().gson.fromJson( result,
++		 * LoginResult.class ); if ( obj != null && obj.getId() != null ) { loginProfile
++		 * = obj; name = obj.getName(); uniqueId = Util.getUUID( obj.getId() );
++		 * finish(); return; } disconnect( bungee.getTranslation( "offline_mode_player"
++		 * ) ); } else { disconnect( bungee.getTranslation( "mojang_fail" ) );
++		 * bungee.getLogger().log( Level.SEVERE, "Error authenticating " + getName() +
++		 * " with minecraft.net", error ); } } };
++		 */
++
++		// HttpClient.get( authURL, ch.getHandle().eventLoop(), handler );
++	}
++
++	private void finish() {
++		if (isOnlineMode()) {
++			// Check for multiple connections
++			// We have to check for the old name first
++			ProxiedPlayer oldName = bungee.getPlayer(getName());
++			if (oldName != null) {
++				// TODO See #1218
++				oldName.disconnect(bungee.getTranslation("already_connected_proxy"));
++			}
++			// And then also for their old UUID
++			ProxiedPlayer oldID = bungee.getPlayer(getUniqueId());
++			if (oldID != null) {
++				// TODO See #1218
++				oldID.disconnect(bungee.getTranslation("already_connected_proxy"));
++			}
++		} else {
++			// In offline mode the existing user stays and we kick the new one
++			ProxiedPlayer oldName = bungee.getPlayer(getName());
++			if (oldName != null) {
++				// TODO See #1218
++				disconnect(bungee.getTranslation("already_connected_proxy"));
++				return;
++			}
++
++		}
++
++		offlineId = UUID.nameUUIDFromBytes(("OfflinePlayer:" + getName()).getBytes(Charsets.UTF_8));
++		if (uniqueId == null) {
++			uniqueId = offlineId;
++		}
++
++		Callback<LoginEvent> complete = new Callback<LoginEvent>() {
++			@Override
++			public void done(LoginEvent result, Throwable error) {
++				if (result.isCancelled()) {
++					disconnect(result.getCancelReasonComponents());
++					return;
++				}
++				if (ch.isClosed()) {
++					return;
++				}
++
++				ch.getHandle().eventLoop().execute(new Runnable() {
++					@Override
++					public void run() {
++						if (!ch.isClosing()) {
++							UserConnection userCon = new UserConnection(bungee, ch, getName(), InitialHandler.this);
++							userCon.setCompressionThreshold(BungeeCord.getInstance().config.getCompressionThreshold());
++							userCon.init();
++
++							unsafe.sendPacket(new LoginSuccess(getUniqueId().toString(), getName())); // With dashes in
++																										// between
++							ch.setProtocol(Protocol.GAME);
++
++							ch.getHandle()
++									.pipeline()
++									.get(HandlerBoss.class)
++									.setHandler(new UpstreamBridge(bungee, userCon));
++							bungee.getPluginManager().callEvent(new PostLoginEvent(userCon));
++							ServerInfo server;
++							if (bungee.getReconnectHandler() != null) {
++								server = bungee.getReconnectHandler().getServer(userCon);
++							} else {
++								server = AbstractReconnectHandler.getForcedHost(InitialHandler.this);
++							}
++							if (server == null) {
++								server = bungee.getServerInfo(listener.getDefaultServer());
++							}
++
++							userCon.connect(server, null, true, ServerConnectEvent.Reason.JOIN_PROXY);
++
++							thisState = State.FINISHED;
++						}
++					}
++				});
++			}
++		};
++
++		// fire login event
++		bungee.getPluginManager().callEvent(new LoginEvent(InitialHandler.this, complete, this.getLoginProfile())); // Waterfall:
++																													// Parse
++																													// LoginResult
++																													// object
++																													// to
++																													// new
++																													// constructor
++																													// of
++																													// LoginEvent
++	}
+
+     @Override
+     public void handle(LoginPayloadResponse response) throws Exception
+--
+2.17.1
